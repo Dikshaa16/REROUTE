@@ -1,0 +1,155 @@
+// The signed-in session. The access token lives in memory; the refresh cookie restores it on load.
+import { useEffect, useSyncExternalStore } from 'react'
+import { api, apiBase, cookie, isSignedOutError, onAuthChange, refreshSession, setAccessToken, setForcedOffline } from '@/api/client'
+import { keys, queryClient } from '@/api/queries'
+import type { Token, User } from '@/api/types'
+import { cancelPendingCheckins } from './actions'
+import { stopTracking } from './location'
+import { clearQueue } from './offlineQueue'
+import { native } from './platform'
+import { dropPush } from './push'
+import { clearShareTokens } from './shareTokens'
+import { setState } from './store'
+
+export type SessionStatus = 'loading' | 'signedIn' | 'signedOut'
+
+let status: SessionStatus = 'loading'
+const listeners = new Set<() => void>()
+
+function set(next: SessionStatus) {
+  if (status === next) return
+  status = next
+  listeners.forEach((l) => l())
+}
+
+export function getSessionStatus() {
+  return status
+}
+
+/** Calls `listener` on every change of the session's status; returns the unsubscribe. */
+export function onSessionChange(listener: () => void): () => void {
+  listeners.add(listener)
+  return () => listeners.delete(listener)
+}
+
+export function useSessionStatus() {
+  return useSyncExternalStore(
+    (l) => {
+      listeners.add(l)
+      return () => listeners.delete(l)
+    },
+    () => status,
+  )
+}
+
+// A new token signs in; losing it (a refused refresh, or signing out) signs out. The app shell then
+// sends the traveller to Sign in, with the screen they were on, and the live stream restarts once
+// they are back.
+onAuthChange((signedIn) => {
+  if (signedIn) return set('signedIn')
+  if (status === 'loading') return
+  // The session ended (a refused refresh): stop following the phone, and keep none of the trip on it
+  // for whoever picks the phone up next. Check-ins waiting to sync stay, for when the traveller is back.
+  if (status === 'signedIn') {
+    stopTracking()
+    queryClient.clear()
+    localStorage.removeItem('reroute:cache')
+  }
+  set('signedOut')
+})
+
+/**
+ * Restore the session from the refresh cookie. Only a refused cookie signs out: if the server
+ * can't be reached (no signal, or a weak one) and this phone has the traveller's saved session,
+ * the app opens in offline mode with the saved plan.
+ */
+export async function restoreSession() {
+  const result = await refreshSession()
+  if (result === 'ok') return set('signedIn')
+  const cachedUser = queryClient.getQueryData<User>(keys.me)
+  set(result === 'unreachable' && cachedUser ? 'signedIn' : 'signedOut')
+}
+
+let started = false
+
+/** Restore the session once per page load. */
+export function useRestoreSession() {
+  useEffect(() => {
+    if (started) return
+    started = true
+    void restoreSession()
+  }, [])
+}
+
+function accept(token: Token) {
+  // Someone else signing in on this phone must not see the last traveller's saved plan.
+  const previous = queryClient.getQueryData<User>(keys.me)
+  if (previous && previous.userId !== token.user.userId) queryClient.clear()
+  // The Android app keeps its refresh token (a browser has it as a cookie).
+  if (native.session && token.refreshToken) void native.session.save(token.refreshToken).catch(() => {})
+  setAccessToken(token.accessToken)
+  queryClient.setQueryData(keys.me, token.user)
+  set('signedIn')
+}
+
+export async function signInDemo(as: 'traveller' | 'moderator' = 'traveller') {
+  accept(await api.post<Token>('/v1/auth/demo', { as }, { noRefresh: true }))
+}
+
+export async function signInWithGoogle(code: string) {
+  accept(await api.post<Token>('/v1/auth/google', { code }, { noRefresh: true }))
+}
+
+/** A new account with an email and a password. It starts with no trips, and Roo meets it on /welcome. */
+export async function signUp(name: string, email: string, password: string) {
+  accept(await api.post<Token>('/v1/auth/signup', { name, email, password }, { noRefresh: true }))
+}
+
+export async function signInWithPassword(email: string, password: string) {
+  accept(await api.post<Token>('/v1/auth/login', { email, password }, { noRefresh: true }))
+}
+
+export async function signOut() {
+  // The phone stops getting this traveller's alerts as pushes: taken off while the session can still say so. Not
+  // for long on a weak signal: ending the session below forgets the phone on the server too.
+  await Promise.race([dropPush(true).catch(() => {}), new Promise((resolve) => setTimeout(resolve, 3000))])
+  try {
+    const kept = native.session ? await native.session.load() : null
+    if (native.session) {
+      // The Android app ends its own token's session on the server, then forgets it.
+      await native.session.clear()
+      if (kept)
+        await fetch(`${apiBase}/v1/auth/logout`, {
+          method: 'POST',
+          credentials: 'omit',
+          headers: { 'Content-Type': 'application/json', 'X-Reroute-Client': 'android' },
+          body: JSON.stringify({ refreshToken: kept }),
+        })
+    } else {
+      await fetch(`${apiBase}/v1/auth/logout`, { method: 'POST', credentials: 'include', headers: { 'X-CSRF-Token': cookie('rr_csrf') } })
+    }
+  } catch {
+    /* offline: the local session still ends */
+  }
+  // Nothing of this traveller's stays on the phone: location tracking, saved plan, waiting check-ins,
+  // share links, demo switches.
+  stopTracking()
+  cancelPendingCheckins()
+  clearQueue()
+  clearShareTokens()
+  setForcedOffline(false)
+  setState({ demo: { enabled: false, offline: false }, change: null, autoBanner: null, leaveNow: null, pendingDelay: null, optimisticDone: [], started: null, tripId: null, connections: {}, rooChat: false, ricoVoice: null, ricoGuide: false })
+  queryClient.clear()
+  localStorage.removeItem('reroute:cache')
+  setAccessToken(null)
+  set('signedOut')
+}
+
+export { isSignedOutError }
+
+/** For tests. */
+export function resetSession(next: SessionStatus = 'loading') {
+  status = next
+  started = false
+  listeners.forEach((l) => l())
+}

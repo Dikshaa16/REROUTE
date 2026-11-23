@@ -1,0 +1,136 @@
+import AxeBuilder from '@axe-core/playwright'
+import { expect, test, type Page } from '@playwright/test'
+
+// Needs the full stack with DEMO_LOGIN=true. Skipped when E2E_BASE_URL is unset.
+test.skip(!process.env.E2E_BASE_URL, 'Set E2E_BASE_URL to run against a running stack')
+
+async function noSeriousIssues(page: Page, name: string) {
+  // Let the screen's fade-in finish: axe measures contrast with the opacity of the moment.
+  // CSS and Web Animations show up in getAnimations(); Motion's JavaScript-driven fades only show
+  // as an inline opacity between 0 and 1, and every one of them ends at 0 or 1 (the Now pulse,
+  // marked data-looping, is the one that never ends). Placeholders count as unsettled too: the content
+  // that replaces them fades in, and axe would measure it mid-fade.
+  await page.waitForFunction(() => {
+    if (document.querySelector('[data-skeleton], [aria-busy="true"]')) return false
+    const main = document.getElementById('main')
+    const cssSettled = document.getAnimations().every((a) => a.playState !== 'running' || a.effect?.getComputedTiming().iterations === Infinity)
+    const motionSettled = [...document.querySelectorAll<HTMLElement>('[style*="opacity"]:not([data-looping])')].every((el) => {
+      const o = Number.parseFloat(el.style.opacity)
+      return Number.isNaN(o) || o === 0 || o === 1
+    })
+    return (!main || getComputedStyle(main).opacity === '1') && cssSettled && motionSettled
+  })
+  const results = await new AxeBuilder({ page }).withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa']).analyze()
+  const serious = results.violations.filter((v) => v.impact === 'critical' || v.impact === 'serious')
+  // Name each failing element and why, so a failure in CI explains itself.
+  const found = serious.flatMap((v) => v.nodes.slice(0, 5).map((n) => `${name}: ${v.id} at ${n.target.join(' ')}: ${n.any[0]?.message ?? n.failureSummary ?? ''}`))
+  expect(found).toEqual([])
+}
+
+async function signInAsDemo(page: Page) {
+  await page.goto('/signin')
+  await page.getByRole('button', { name: 'Use the demo account' }).click()
+  await expect(page).not.toHaveURL(/signin/)
+}
+
+/** Plan the sample day ("Plan my day", or "Plan my day again"), so every screen has a day to show. */
+async function planTheDay(page: Page) {
+  await page.goto('/plan')
+  await page.getByRole('button', { name: /^Plan my day/ }).click()
+  await expect(page).toHaveURL(/\/$/, { timeout: 30_000 })
+}
+
+for (const scheme of ['light', 'dark'] as const) {
+  test.describe(`${scheme} theme`, () => {
+    test.use({ colorScheme: scheme })
+
+    test('sign in screen', async ({ page }) => {
+      await page.goto('/signin')
+      await expect(page.getByRole('heading', { level: 1, name: /reroute your day/ })).toBeVisible()
+      await noSeriousIssues(page, 'signin')
+    })
+
+    test('main screens', async ({ page }, info) => {
+      await signInAsDemo(page)
+      await planTheDay(page)
+      for (const [path, heading] of [
+        ['/', 'Bengaluru'],
+        ['/plan', /trip/i],
+        ['/raasta', 'Raasta'],
+        ['/me', 'Me'],
+        ['/summary', /in Bengaluru|Day summary/],
+        ['/leg/2', /to/],
+        ['/why', 'Why this plan'],
+        ['/welcome', 'Meet Rico, your travel companion'],
+      ] as const) {
+        await page.goto(path)
+        await expect(page.getByRole('heading', { level: 1, name: heading }).first()).toBeVisible({ timeout: 15_000 })
+        // Rico introduces itself over a few seconds, each line fading in: check once it has asked its question.
+        if (path === '/welcome') await expect(page.getByRole('group', { name: 'Answers' })).toBeVisible({ timeout: 30_000 })
+        await noSeriousIssues(page, path)
+        await page.screenshot({ path: `test-results/screens/${info.project.name}-${scheme}${path.replace(/\//g, '_') || '_today'}.png`, fullPage: true })
+      }
+    })
+
+    test('the chat with Rico, with a change it offers', async ({ page }) => {
+      await signInAsDemo(page)
+      await planTheDay(page)
+      await page.getByRole('button', { name: 'Rico, your travel companion. Chat with Rico' }).click()
+      const chat = page.getByRole('dialog', { name: 'Rico' })
+      await expect(chat.getByRole('log')).toContainText(/Good (morning|afternoon|evening)/)
+      await chat.getByLabel('Message Rico').fill('move the bank to tomorrow')
+      await chat.getByRole('button', { name: 'Send' }).click()
+      await expect(chat.getByRole('button', { name: 'Move it' })).toBeVisible()
+      await noSeriousIssues(page, 'roo-chat')
+      await page.keyboard.press('Escape')
+      await expect(chat).toBeHidden()
+    })
+
+    test('late for the meeting: going anyway, the banner and Tell them', async ({ page }) => {
+      test.setTimeout(120_000)
+      await signInAsDemo(page)
+      await page.getByRole('button', { name: 'Simulate', exact: true }).click()
+      await page.getByRole('button', { name: 'Reset the demo' }).click()
+      await planTheDay(page)
+      // 08:45 at the hotel, 40 minutes late: the 10:00 meeting can only be reached late.
+      await page.getByRole('button', { name: 'Simulate', exact: true }).click()
+      const clock = page.waitForResponse((r) => r.url().endsWith('/demo/clock') && r.request().method() === 'POST')
+      await page.getByLabel('Current time').fill('08:45')
+      await page.getByRole('heading', { name: 'Simulate' }).click()
+      await clock
+      await page.keyboard.press('Escape')
+      await page.getByRole('button', { name: 'Running late' }).click()
+      const sheet = page.getByRole('dialog')
+      await sheet.getByRole('radio', { name: 'About 40 min' }).focus()
+      await page.keyboard.press('Space')
+      await sheet.getByRole('button', { name: 'Update my times' }).click()
+      const anyway = sheet.getByRole('radio', { name: /Go anyway/ })
+      await expect(anyway).toBeAttached({ timeout: 20_000 })
+      await anyway.focus()
+      await page.keyboard.press('Space')
+      await noSeriousIssues(page, 'go-anyway')
+      await sheet.getByRole('button', { name: 'Reroute my day' }).click()
+      await expect(sheet).toBeHidden({ timeout: 20_000 })
+      const banner = page.getByRole('alert').filter({ hasText: 'after its 10:00 start' })
+      await expect(banner).toBeVisible({ timeout: 20_000 })
+      await noSeriousIssues(page, 'late-banner')
+      await banner.getByRole('button', { name: 'Tell them' }).click()
+      await expect(page.getByLabel('Your message')).toBeVisible()
+      await noSeriousIssues(page, 'tell-them')
+    })
+
+    test('running late sheet is reachable by keyboard', async ({ page }) => {
+      await signInAsDemo(page)
+      await planTheDay(page)
+      const late = page.getByRole('button', { name: 'Running late' })
+      if (!(await late.isEnabled())) test.skip(true, 'No open task to report a delay on')
+      await late.focus()
+      await page.keyboard.press('Enter')
+      await expect(page.getByRole('dialog')).toBeVisible()
+      await noSeriousIssues(page, 'running-late')
+      await page.keyboard.press('Escape')
+      await expect(page.getByRole('dialog')).toBeHidden()
+      await expect(late).toBeFocused()
+    })
+  })
+}

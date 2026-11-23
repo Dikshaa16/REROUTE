@@ -1,0 +1,195 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { api, refreshSession, setAccessToken, setForcedOffline } from '@/api/client'
+import { keys, queryClient } from '@/api/queries'
+import type { User } from '@/api/types'
+import { native } from './platform'
+import { getSessionStatus, resetSession, restoreSession, signInDemo, signOut } from './session'
+import { getState, setState } from './store'
+
+const user = { userId: 'u1', name: 'Asha Rao', email: 'asha@example.com', role: 'traveller', isDemo: true } as unknown as User
+
+function json(status: number, body: unknown) {
+  return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+}
+
+function stubFetch(impl: (url: string, init: RequestInit) => Promise<Response>) {
+  vi.stubGlobal('fetch', vi.fn((url: string | URL, init: RequestInit = {}) => impl(String(url), init)))
+}
+
+beforeEach(() => {
+  setForcedOffline(false)
+  setAccessToken(null)
+  queryClient.clear()
+  resetSession()
+  // A browser that has signed in here before carries the readable CSRF cookie.
+  document.cookie = 'rr_csrf=test-csrf; path=/'
+})
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+  vi.useRealTimers()
+})
+
+describe('refreshSession', () => {
+  it('tries again after going back online (a quick answer never sticks)', async () => {
+    setForcedOffline(true)
+    expect(await refreshSession()).toBe('unreachable')
+    setForcedOffline(false)
+    stubFetch(async () => json(200, { accessToken: 'tok' }))
+    expect(await refreshSession()).toBe('ok')
+  })
+
+  it("skips the request on a first visit, with no session cookie, and answers 'rejected'", async () => {
+    document.cookie = 'rr_csrf=; path=/; expires=Thu, 01 Jan 1970 00:00:00 GMT'
+    const fetchSpy = vi.fn()
+    stubFetch(fetchSpy)
+    expect(await refreshSession()).toBe('rejected')
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it("answers 'ok' and keeps the new token", async () => {
+    stubFetch(async () => json(200, { accessToken: 'tok' }))
+    expect(await refreshSession()).toBe('ok')
+  })
+
+  it("answers 'rejected' when the server refuses the cookie", async () => {
+    stubFetch(async () => json(401, { error: { code: 'UNAUTHENTICATED', message: 'Sign in to continue.' } }))
+    expect(await refreshSession()).toBe('rejected')
+  })
+
+  it("answers 'unreachable' with no network, a rate limit or a server error, never 'rejected'", async () => {
+    stubFetch(async () => Promise.reject(new TypeError('Failed to fetch')))
+    expect(await refreshSession()).toBe('unreachable')
+    stubFetch(async () => json(502, {}))
+    expect(await refreshSession()).toBe('unreachable')
+    stubFetch(async () => json(429, { error: { code: 'RATE_LIMITED', message: 'Too many requests. Wait a minute and try again.' } }))
+    expect(await refreshSession()).toBe('unreachable')
+  })
+
+  it("gives up after 6 seconds on a weak connection and answers 'unreachable'", async () => {
+    vi.useFakeTimers()
+    stubFetch(
+      (_url, init) =>
+        new Promise((_resolve, reject) => {
+          init.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')))
+        }),
+    )
+    const result = refreshSession()
+    await vi.advanceTimersByTimeAsync(6000)
+    expect(await result).toBe('unreachable')
+  })
+})
+
+describe('restoring the session', () => {
+  it('stays signed in, offline, when the server is out of reach and this phone has the session', async () => {
+    queryClient.setQueryData(keys.me, user)
+    stubFetch(async () => Promise.reject(new TypeError('Failed to fetch')))
+    await restoreSession()
+    expect(getSessionStatus()).toBe('signedIn')
+  })
+
+  it('signs out when the cookie is refused, even with a saved session', async () => {
+    queryClient.setQueryData(keys.me, user)
+    stubFetch(async () => json(401, {}))
+    await restoreSession()
+    expect(getSessionStatus()).toBe('signedOut')
+  })
+
+  it('signs out when out of reach with nothing saved', async () => {
+    stubFetch(async () => Promise.reject(new TypeError('Failed to fetch')))
+    await restoreSession()
+    expect(getSessionStatus()).toBe('signedOut')
+  })
+
+  it('moves to signed out when a later refresh is refused (the session ran out)', async () => {
+    stubFetch(async () => json(200, { accessToken: 'tok' }))
+    await restoreSession()
+    expect(getSessionStatus()).toBe('signedIn')
+    const responses = [json(401, {}), json(401, {})]
+    stubFetch(async () => responses.shift()!)
+    await expect(api.get('/v1/me')).rejects.toMatchObject({ status: 401 })
+    expect(getSessionStatus()).toBe('signedOut')
+  })
+
+  it('keeps the session when a refresh after a 401 is out of reach, and reports it as offline', async () => {
+    stubFetch(async () => json(200, { accessToken: 'tok' }))
+    await restoreSession()
+    let n = 0
+    stubFetch(async () => (n++ === 0 ? json(401, {}) : Promise.reject(new TypeError('Failed to fetch'))))
+    await expect(api.get('/v1/me')).rejects.toMatchObject({ code: 'OFFLINE' })
+    expect(getSessionStatus()).toBe('signedIn')
+  })
+})
+
+describe('the session ending', () => {
+  it('clears the saved trip and stops following the phone, but keeps check-ins waiting to sync', async () => {
+    stubFetch(async () => json(200, { accessToken: 'tok' }))
+    await restoreSession()
+    expect(getSessionStatus()).toBe('signedIn')
+    queryClient.setQueryData(keys.me, user)
+    localStorage.setItem('reroute:cache', '{}')
+    localStorage.setItem('reroute:tracking', '1')
+    localStorage.setItem('reroute:checkin-queue', '[]')
+    // A refused refresh drops the token.
+    setAccessToken(null)
+    expect(getSessionStatus()).toBe('signedOut')
+    expect(queryClient.getQueryData(keys.me)).toBeUndefined()
+    expect(localStorage.getItem('reroute:cache')).toBeNull()
+    expect(localStorage.getItem('reroute:tracking')).toBeNull()
+    expect(localStorage.getItem('reroute:checkin-queue')).toBe('[]')
+  })
+})
+
+describe('in the Android app', () => {
+  let kept: string | null = null
+  beforeEach(() => {
+    kept = null
+    native.session = {
+      load: vi.fn(async () => kept),
+      save: vi.fn(async (token: string) => {
+        kept = token
+      }),
+      clear: vi.fn(async () => {
+        kept = null
+      }),
+    }
+  })
+  afterEach(() => {
+    delete native.session
+  })
+
+  it('keeps the refresh token the server hands the app on sign-in', async () => {
+    stubFetch(async () => json(200, { accessToken: 'tok', refreshToken: 'app-refresh-0000000000000009', user }))
+    await signInDemo()
+    expect(getSessionStatus()).toBe('signedIn')
+    await vi.waitFor(() => expect(kept).toBe('app-refresh-0000000000000009'))
+  })
+
+  it('restores the session from the kept token when the app opens', async () => {
+    kept = 'app-refresh-0000000000000009'
+    stubFetch(async () => json(200, { accessToken: 'tok', refreshToken: 'app-refresh-000000000000000a' }))
+    await restoreSession()
+    expect(getSessionStatus()).toBe('signedIn')
+    expect(kept).toBe('app-refresh-000000000000000a')
+  })
+
+  it('signs out with its token in the body and forgets it', async () => {
+    kept = 'app-refresh-0000000000000009'
+    const sent: { url: string; init: RequestInit }[] = []
+    stubFetch(async (url, init) => {
+      sent.push({ url, init })
+      return new Response(null, { status: 204 })
+    })
+    setState({ ricoGuide: true })
+    await signOut()
+    // Rico takes his guide glasses off for whoever signs in next.
+    expect(getState().ricoGuide).toBe(false)
+    expect(sent).toHaveLength(1)
+    expect(sent[0].url).toMatch(/\/v1\/auth\/logout$/)
+    expect(JSON.parse(String(sent[0].init.body))).toEqual({ refreshToken: 'app-refresh-0000000000000009' })
+    expect(new Headers(sent[0].init.headers).get('X-CSRF-Token')).toBeNull()
+    expect(kept).toBeNull()
+    expect(getSessionStatus()).toBe('signedOut')
+  })
+})
+

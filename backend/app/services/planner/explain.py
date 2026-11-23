@@ -1,0 +1,126 @@
+"""Explanations built from reason codes with fixed sentence templates. No AI model is involved."""
+
+from __future__ import annotations
+
+from .util import count_word, hhmm, lower_first, rupees
+
+
+def shifted(minutes: int, automatic: bool, behind_min: int | None = None) -> str:
+    """`minutes` is how far the next leave-by time moved: positive is later, negative earlier."""
+    if automatic and behind_min and minutes > 0:
+        return f"You were {behind_min} min behind. Reroute moved your later stops {minutes} min later."
+    if minutes > 0:
+        return f"Your day still fits. Every later stop moves {minutes} min later. No extra cost."
+    if minutes < 0:
+        return f"Your day still fits. Your next stop moves {-minutes} min earlier. No extra cost."
+    return "Your day still fits. Your later stops have new times. No extra cost."
+
+
+def fixed_at_risk(title: str, arrival: int, start: int, buffer_min: int) -> str:
+    """A delay reported on the way to a fixed task: when the traveller gets there, against its start."""
+    name = lower_first(title)
+    if arrival > start:
+        return f"You'll reach the {name} at about {hhmm(arrival)}, after its {hhmm(start)} start."
+    if arrival == start:
+        return f"You'll reach the {name} at about {hhmm(arrival)}, just as it starts; you need {buffer_min} min before it."
+    return f"You'll reach the {name} at about {hhmm(arrival)}, {start - arrival} min before its {hhmm(start)} start; you need {buffer_min}."
+
+
+def late_label(minutes: int) -> str:
+    return f"Go anyway, about {minutes} min late" if minutes > 0 else "Go anyway"
+
+
+def late_consequence(title: str, arrival: int, start: int, moved: str | None) -> str:
+    """The fixed task stays where it is; you get there late. `moved`: what else changes, if anything."""
+    base = f"You reach the {lower_first(title)} at about {hhmm(arrival)}; it starts at {hhmm(start)}"
+    return f"{base}. {moved}" if moved else base
+
+
+def late_explanation(title: str, arrival: int, start: int, uses_cab: bool, extra: int) -> str:
+    name = lower_first(title)
+    how = f" A cab gets you there soonest, for {rupees(extra)} more." if uses_cab and extra > 0 else ""
+    tell = " Tell them you’re running late." if arrival > start else " You’ll walk in just as it starts."
+    return f"The {name} stays at {hhmm(start)}: it isn’t yours to move, so you go anyway.{how} The rest of your day is planned from when you get there.{tell}"
+
+
+def late_note(title: str, arrival: int, start: int) -> str:
+    """For a fresh plan that can only reach a fixed task late (or with less than the usual margin)."""
+    name = lower_first(title)
+    if arrival > start:
+        return f"You’ll reach the {name} at about {hhmm(arrival)}, {arrival - start} min after it starts. Tell them you’re running late."
+    return f"You’ll reach the {name} at about {hhmm(arrival)}, just before its {hhmm(start)} start."
+
+
+def on_time() -> str:
+    return "You're on time. Nothing changed."
+
+
+def must_choose(failure: str | None, title: str | None, at: int | None) -> str:
+    name = lower_first(title) if title else "next stop"
+    if failure == "window" and at is not None:
+        return f"The {name} closes at {hhmm(at)}. Choose how to fix the rest of today."
+    if failure == "fixed" and at is not None:
+        return f"The {name} starts at {hhmm(at)}. Choose how to fix the rest of today."
+    if failure == "service":
+        return f"The last shared auto for the {name} will have gone. Choose how to fix the rest of today."
+    if failure == "unavailable":
+        return f"The shared auto route to the {name} isn't confirmed right now. Choose how to fix the rest of today."
+    return "Your later stops no longer fit. Choose how to fix the rest of today."
+
+
+def faster_label(dest_title: str | None, uses_cab: bool) -> str:
+    if dest_title is None:
+        return "Take a cab back" if uses_cab else "Take a faster way back"
+    return f"Take a cab to the {lower_first(dest_title)}" if uses_cab else f"Take a faster way to the {lower_first(dest_title)}"
+
+
+def faster_consequence(today_count: int) -> str:
+    return f"All {count_word(today_count)} tasks still happen today"
+
+
+def faster_explanation(today_count: int, extra: int, uses_cab: bool) -> str:
+    how = "A cab" if uses_cab else "A faster route"
+    if extra > 0:
+        return f"{how} keeps all {count_word(today_count)} tasks today for {rupees(extra)} more."
+    return f"{how} keeps all {count_word(today_count)} tasks today at no extra cost."
+
+
+def moved_consequence(moved: list[tuple[str, int | None]]) -> str:
+    if len(moved) == 1:
+        title, at = moved[0]
+        when = f", {hhmm(at)}" if at is not None else ""
+        return f"The {lower_first(title)} moves to tomorrow{when}"
+    return f"{count_word(len(moved)).capitalize()} tasks move to tomorrow"
+
+
+def moved_explanation(moved: list[tuple[str, int | None]], extra: int) -> str:
+    cost = "at no extra cost" if extra <= 0 else f"for {rupees(extra)} more"
+    if len(moved) == 1:
+        title, at = moved[0]
+        when = f" at {hhmm(at)}" if at is not None else ""
+        return f"Moving the {lower_first(title)} to tomorrow{when} keeps the rest of today {cost}."
+    return f"Moving {count_word(len(moved))} tasks to tomorrow keeps the rest of today {cost}."
+
+
+def skipped_label(titles: list[str]) -> str:
+    return f"Skip the {lower_first(titles[0])}" if len(titles) == 1 else f"Skip {count_word(len(titles))} tasks"
+
+
+def skipped_consequence(titles: list[str]) -> str:
+    return f"The {lower_first(titles[0])} is skipped today" if len(titles) == 1 else f"{count_word(len(titles)).capitalize()} tasks are skipped today"
+
+
+def skipped_explanation(titles: list[str], extra: int) -> str:
+    cost = "at no extra cost" if extra <= 0 else f"for {rupees(extra)} more"
+    return (
+        f"Skipping the {lower_first(titles[0])} keeps every other stop {cost}."
+        if len(titles) == 1
+        else f"Skipping {count_word(len(titles))} low-priority tasks keeps every other stop {cost}."
+    )
+
+
+def created(n_tasks: int, approximate: bool) -> str:
+    base = f"Planned {count_word(n_tasks)} {'task' if n_tasks == 1 else 'tasks'} with the lowest travel time and fare."
+    if approximate:
+        base += " With this many tasks the order is a good estimate, not guaranteed to be the cheapest."
+    return base + " Times and fares are estimates."

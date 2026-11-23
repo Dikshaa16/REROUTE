@@ -1,0 +1,302 @@
+"""Simulated bookings: a train ticket for a train task, a flight, a cab for a leg, entry tickets to a sight. A demo:
+nothing real is booked.
+
+They're paid from the wallet's simulated money: the booking and its charge commit together, and a
+cancellation refunds. They exist for every account while SIMULATED_SERVICES=true (the default);
+otherwise every one answers 404.
+"""
+
+from __future__ import annotations
+
+from datetime import date
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy import select
+
+from app.clock import minutes_of_day, tz_for
+from app.deps import CurrentUser, Db, OwnedTrip, simulated_only
+from app.errors import ApiError
+from app.models import Booking, Place, Task, Trip
+from app.schemas import AirportOut, BookingIn, BookingOut, CabOptionOut, FlightFareOut, FlightOptionOut, PostBody, TrainClassOut, TrainOptionOut
+from app.services import booking_sim as sim
+from app.services import places, plan_store, wallet
+
+router = APIRouter(prefix="/v1", tags=["bookings"], dependencies=[Depends(simulated_only)])
+
+
+def _task(db, trip: Trip, task_id: str | None) -> Task:
+    task = db.get(Task, task_id) if task_id else None
+    if task is None or task.trip_id != trip.trip_id:
+        raise ApiError(404, "Task not found.")
+    return task
+
+
+def _origin(task: Task) -> str:
+    name = task.place.name if task.place else ""
+    return name if "station" in name.lower() else f"{name or 'Bengaluru'} station"
+
+
+def _trains(trip: Trip, task: Task, destination: str) -> list[sim.TrainOption]:
+    tz = tz_for(trip.utc_offset)
+    around = minutes_of_day(task.fixed_start, task.day, tz) if task.fixed_start else 18 * 60
+    return sim.train_options(trip.trip_id, str(task.day), _origin(task), destination, around)
+
+
+def _train_out(t: sim.TrainOption) -> TrainOptionOut:
+    return TrainOptionOut(
+        train_no=t.train_no,
+        name=t.name,
+        origin=t.origin,
+        destination=t.destination,
+        departs=sim.hhmm(t.departs),
+        arrives=sim.hhmm(t.arrives),
+        arrives_next_day=t.arrives // (24 * 60),
+        duration_min=t.duration_min,
+        classes=[TrainClassOut(code=c.code, label=c.label, fare_inr=c.fare_inr, status=c.status, availability=c.availability) for c in t.classes],
+    )
+
+
+def _leg_fare(db, trip: Trip, to_id: str) -> int:
+    """The cab fare of the active plan's leg to `to_id`, or an estimate from its travel time."""
+    plan = plan_store.active_plan(db, trip.trip_id)
+    legs = [*(plan.legs if plan else []), *((plan.done_legs or []) if plan else [])]
+    leg = next((x for x in legs if (x.get("taskId") or "end") == to_id), None)
+    if leg is None:
+        raise ApiError(404, "That leg isn't in your plan.")
+    return leg["fareInr"] if leg.get("mode") == "cab" and leg.get("fareInr") else max(80, round(leg.get("travelMin", 20) * 9))
+
+
+def _out(b: Booking) -> BookingOut:
+    return BookingOut.model_validate(b)
+
+
+@router.get("/trips/{trip_id}/bookings", response_model=list[BookingOut], response_model_by_alias=True, summary="Your simulated tickets and rides")
+def list_bookings(trip: OwnedTrip, db: Db) -> list[BookingOut]:
+    rows = db.scalars(select(Booking).where(Booking.trip_id == trip.trip_id).order_by(Booking.created_at.desc()))
+    return [_out(b) for b in rows]
+
+
+@router.get(
+    "/trips/{trip_id}/train-options", response_model=list[TrainOptionOut], response_model_by_alias=True, summary="Sample trains for a train task (demo)"
+)
+def train_options(
+    trip: OwnedTrip,
+    db: Db,
+    task_id: Annotated[str, Query(alias="taskId")],
+    to: Annotated[str, Query(min_length=2, max_length=60)],
+) -> list[TrainOptionOut]:
+    return [_train_out(t) for t in _trains(trip, _task(db, trip, task_id), to)]
+
+
+@router.get("/trips/{trip_id}/cab-options", response_model=list[CabOptionOut], response_model_by_alias=True, summary="Cab choices for a leg (demo)")
+def cab_options(trip: OwnedTrip, db: Db, to_id: Annotated[str, Query(alias="toId", max_length=40)]) -> list[CabOptionOut]:
+    options = sim.cab_options(trip.trip_id, to_id, _leg_fare(db, trip, to_id))
+    return [
+        CabOptionOut(
+            option_id=o.option_id,
+            provider=o.provider,
+            provider_label=o.provider_label,
+            vehicle=o.vehicle,
+            vehicle_label=o.vehicle_label,
+            seats=o.seats,
+            eta_min=o.eta_min,
+            fare_inr=o.fare_inr,
+        )
+        for o in options
+    ]
+
+
+def _flight_out(f: sim.FlightOption) -> FlightOptionOut:
+    return FlightOptionOut(
+        flight_no=f.flight_no,
+        airline=sim.AIRLINE,
+        origin=f.origin,
+        destination=f.destination,
+        origin_city=sim.AIRPORTS[f.origin][0],
+        destination_city=sim.AIRPORTS[f.destination][0],
+        date=f.day,
+        departs=sim.hhmm(f.departs),
+        arrives=sim.hhmm(f.arrives),
+        arrives_next_day=f.arrives // (24 * 60),
+        duration_min=f.duration_min,
+        stops=f.stops,
+        fares=[FlightFareOut(cabin=x.cabin, label=x.label, fare_inr=x.fare_inr, seats_left=x.seats_left) for x in f.fares],
+    )
+
+
+def _flights(origin: str, to: str, day: date) -> list[sim.FlightOption]:
+    if origin not in sim.AIRPORTS or to not in sim.AIRPORTS or origin == to:
+        raise ApiError(422, "Choose two different airports SkyHop flies between.", code="VALIDATION_ERROR")
+    return sim.flight_options(origin, to, day)
+
+
+@router.get("/airports", response_model=list[AirportOut], response_model_by_alias=True, summary="Airports the simulated airline flies between")
+def airports() -> list[AirportOut]:
+    return [AirportOut(code=code, city=city, name=name) for code, (city, name, _lat, _lng) in sim.AIRPORTS.items()]
+
+
+@router.get(
+    "/trips/{trip_id}/flight-options",
+    response_model=list[FlightOptionOut],
+    response_model_by_alias=True,
+    summary="Sample flights between two airports on a day (demo)",
+)
+def flight_options(
+    trip: OwnedTrip,
+    origin: Annotated[str, Query(alias="from", pattern=r"^[A-Z]{3}$")],
+    to: Annotated[str, Query(pattern=r"^[A-Z]{3}$")],
+    day: Annotated[date, Query(alias="date")],
+) -> list[FlightOptionOut]:
+    return [_flight_out(f) for f in _flights(origin, to, day)]
+
+
+@router.post(
+    "/trips/{trip_id}/bookings",
+    response_model=BookingOut,
+    response_model_by_alias=True,
+    status_code=201,
+    summary="Book a train ticket, a flight, a cab or entry tickets to a sight (simulated), paid from the wallet",
+)
+def create_booking(body: BookingIn, trip: OwnedTrip, user: CurrentUser, db: Db) -> BookingOut:
+    seed = f"{trip.trip_id}|{body.idempotency_key}"
+    if body.kind == "flight":
+        if not body.origin or not body.flight_to or not body.flight_date or not body.flight_no or not body.cabin or not body.passengers:
+            raise ApiError(422, "Choose the airports, a day, a flight, a cabin and who is flying.", code="VALIDATION_ERROR")
+        flight = next((f for f in _flights(body.origin, body.flight_to, body.flight_date) if f.flight_no == body.flight_no), None)
+        fare = next((x for x in flight.fares if x.cabin == body.cabin), None) if flight else None
+        if flight is None or fare is None:
+            raise ApiError(422, "That flight or cabin is no longer on offer. Search again.", code="VALIDATION_ERROR")
+        pnr, passengers = sim.book_flight(flight, fare.cabin, [p.model_dump() for p in body.passengers], seed)
+        booking = Booking(
+            trip_id=trip.trip_id,
+            kind="flight",
+            provider="skyhop",
+            reference=pnr,
+            fare_inr=fare.fare_inr * len(passengers),
+            details={
+                "airline": sim.AIRLINE,
+                "flightNo": flight.flight_no,
+                "origin": flight.origin,
+                "destination": flight.destination,
+                "originCity": sim.AIRPORTS[flight.origin][0],
+                "destinationCity": sim.AIRPORTS[flight.destination][0],
+                "date": str(flight.day),
+                "departs": sim.hhmm(flight.departs),
+                "arrives": sim.hhmm(flight.arrives),
+                "arrivesNextDay": flight.arrives // (24 * 60),
+                "cabin": fare.cabin,
+                "cabinLabel": fare.label,
+                "passengers": passengers,
+            },
+        )
+    elif body.kind == "train":
+        task = _task(db, trip, body.task_id)
+        if not body.destination or not body.train_no or not body.travel_class or not body.passengers:
+            raise ApiError(422, "Choose where to, a train, a class and who's travelling.", code="VALIDATION_ERROR")
+        train = next((t for t in _trains(trip, task, body.destination) if t.train_no == body.train_no), None)
+        cls = next((c for c in train.classes if c.code == body.travel_class), None) if train else None
+        if train is None or cls is None:
+            raise ApiError(422, "That train or class isn't on offer. Search again.", code="VALIDATION_ERROR")
+        pnr, passengers, overall = sim.book_train(train, cls.code, [p.model_dump() for p in body.passengers], seed)
+        booking = Booking(
+            trip_id=trip.trip_id,
+            kind="train",
+            task_id=task.task_id,
+            provider=sim.RAIL,
+            reference=pnr,
+            fare_inr=cls.fare_inr * len(passengers),
+            details={
+                "trainNo": train.train_no,
+                "trainName": train.name,
+                "origin": train.origin,
+                "destination": train.destination,
+                "date": str(task.day),
+                "departs": sim.hhmm(train.departs),
+                "arrives": sim.hhmm(train.arrives),
+                "arrivesNextDay": train.arrives // (24 * 60),
+                "travelClass": cls.code,
+                "classLabel": cls.label,
+                "bookingStatus": overall,
+                "passengers": passengers,
+            },
+        )
+    elif body.kind == "ticket":
+        place = db.get(Place, body.place_id) if body.place_id else None
+        # Someone else's own place is as good as unknown: its name would show on the booking.
+        if place is None or not places.can_see(place, user.user_id) or place.city_slug != trip.city_slug or not body.visit_date or not body.option_id:
+            raise ApiError(422, "Choose a place in the trip's city, a day and a ticket.", code="VALIDATION_ERROR")
+        if not trip.start_date <= body.visit_date <= trip.end_date:
+            raise ApiError(422, "Choose a day of the trip.", code="VALIDATION_ERROR")
+        ticket = next((o for o in sim.ticket_options(place.place_id) if o.option_id == body.option_id), None)
+        if ticket is None:
+            raise ApiError(422, "That ticket isn't on offer. Choose again.", code="VALIDATION_ERROR")
+        visitors = body.visitors or 1
+        booking = Booking(
+            trip_id=trip.trip_id,
+            kind="ticket",
+            provider=sim.TICKETS,
+            reference=sim.ticket_number(seed),
+            fare_inr=ticket.fare_inr * visitors,
+            details={
+                "partner": sim.TICKETS_LABEL,
+                "placeId": place.place_id,
+                "place": place.name,
+                "date": str(body.visit_date),
+                "ticket": ticket.option_id,
+                "ticketLabel": ticket.label,
+                "visitors": visitors,
+                "fareEachInr": ticket.fare_inr,
+            },
+        )
+    else:
+        if not body.to_id or not body.option_id:
+            raise ApiError(422, "Choose a ride for the leg.", code="VALIDATION_ERROR")
+        option = next((o for o in sim.cab_options(trip.trip_id, body.to_id, _leg_fare(db, trip, body.to_id)) if o.option_id == body.option_id), None)
+        if option is None:
+            raise ApiError(422, "That ride isn't on offer any more. Choose again.", code="VALIDATION_ERROR")
+        driver = sim.assign_driver(option, seed)
+        booking = Booking(
+            trip_id=trip.trip_id,
+            kind="cab",
+            to_id=body.to_id,
+            provider=option.provider,
+            reference=f"{option.provider[:2].upper()}{driver['otp']}{seed[-4:].upper()}",
+            fare_inr=option.fare_inr,
+            details={"providerLabel": option.provider_label, "vehicle": option.vehicle, "vehicleLabel": option.vehicle_label, **driver},
+        )
+    db.add(booking)
+    db.flush()
+    # Paid from the wallet in the same transaction: not enough money, and nothing is booked.
+    wallet.charge(db, trip.user_id, booking.fare_inr, _label(booking), booking.booking_id)
+    db.commit()
+    db.refresh(booking)
+    return _out(booking)
+
+
+def _label(b: Booking) -> str:
+    d = b.details
+    if b.kind == "flight":
+        return f"Flight {d['flightNo']}, {d['originCity']} to {d['destinationCity']}"
+    if b.kind == "train":
+        return f"Train {d['trainNo']} to {d['destination']}"
+    if b.kind == "ticket":
+        return f"{d['partner']} tickets to {d['place']}"
+    return f"{d['providerLabel']} {d['vehicleLabel'].lower()} ride"
+
+
+@router.post("/trips/{trip_id}/bookings/{booking_id}/cancel", response_model=BookingOut, response_model_by_alias=True, summary="Cancel a simulated booking")
+def cancel_booking(booking_id: str, body: PostBody, trip: OwnedTrip, db: Db) -> BookingOut:
+    booking = db.get(Booking, booking_id)
+    if booking is None or booking.trip_id != trip.trip_id:
+        raise ApiError(404, "Booking not found.")
+    if booking.status != "cancelled":
+        booking.status = "cancelled"
+        # A demo refund: trains keep a small clerkage, flights a cancellation fee, cabs before pickup and entry tickets nothing.
+        fee = {"train": 60, "flight": 500}.get(booking.kind, 0) * len(booking.details.get("passengers", []))
+        refund = max(0, booking.fare_inr - fee)
+        booking.details = {**booking.details, "refundInr": refund}
+        wallet.refund(db, trip.user_id, refund, f"Refund: {_label(booking)}", booking.booking_id)
+        db.commit()
+        db.refresh(booking)
+    return _out(booking)

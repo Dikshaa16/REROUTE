@@ -1,0 +1,293 @@
+// Local UI state (useSyncExternalStore). Trip data lives on the server and in the persisted query
+// cache; this store only holds preferences and transient UI: toasts, the reroute choreography, banners.
+import { useSyncExternalStore } from 'react'
+import { diffDays, type ChangeSet, type DayView } from './timeline'
+
+export type Theme = 'system' | 'light' | 'dark'
+export type ChimeStyle = 'bell' | 'soft' | 'marimba' | 'digital'
+export type VoiceRate = 'slow' | 'normal' | 'fast'
+export interface AlertPrefs {
+  sound: boolean
+  chime: ChimeStyle
+  /** 0 to 1, for the chime and the voice. */
+  volume: number
+  vibrate: boolean
+  voice: boolean
+  /** An Edge neural voice (the server lists them); the phone's own voice is the fallback. */
+  voiceId: string
+  voiceRate: VoiceRate
+}
+/** Rico speaks as Ana, a child's voice, unless the traveller picks another. */
+export const DEFAULT_ALERTS: AlertPrefs = { sound: true, chime: 'bell', volume: 0.8, vibrate: true, voice: true, voiceId: 'en-US-AnaNeural', voiceRate: 'normal' }
+export type Lang = 'en' | 'hi'
+
+export interface Change extends ChangeSet {
+  token: number
+  kind: 'reroute' | 'undo' | 'checkin'
+  before: DayView
+  pillDelayMs: number
+}
+
+export interface UiState {
+  theme: Theme
+  lang: Lang
+  leaveAlerts: boolean
+  /** How alerts reach the traveller, beyond the toast every alert shows. */
+  alerts: AlertPrefs
+  demo: { enabled: boolean; offline: boolean }
+  /** Roo on Today's Now line; "Hide Roo" turns it off and Me turns it back on. */
+  roo: boolean
+  /** The trip the traveller chose to look at; null means the most recent one. */
+  tripId: string | null
+  // Transient, never persisted
+  change: Change | null
+  reveal: number
+  /** The automatic-shift banner. It clears once the plan moves on from `version`, or on the next check-in. */
+  autoBanner: { text: string; previousVersion: number | null; version: number | null } | null
+  /** "Leave now" from the live stream, for leg `seq`. It expires once that leg's leave-by time has passed. */
+  leaveNow: { text: string; at: number; seq: number | null } | null
+  pendingDelay: number | null
+  /** Optimistic check-ins, shown before the server confirms them. */
+  optimisticDone: string[]
+  /**
+   * The traveller said "I've left" for the stop `toId` (a task ID, or "end" for the way back). Kept by
+   * destination, not leg number, so it survives a re-plan and a reload. Local only.
+   */
+  started: { tripId: string; toId: string; day?: string; at?: number } | null
+  /** The chat with Roo is open. */
+  rooChat: boolean
+  /** Simulated partners the traveller has connected in Me (RideNow, RailGo, SkyHop…). */
+  connections: Record<string, boolean>
+  /** Roo reads its chat replies aloud: off until the traveller turns it on. */
+  rooVoice: boolean
+  /** The server has this phone for push (the Android app): its alerts arrive even after the app is closed. */
+  pushReady: boolean
+  /** Rico full screen, talking out loud (components/roo/RicoVoice.tsx): why he came, and as what. */
+  ricoVoice: RicoVoiceRequest | null
+  /** Rico out and about along the bottom of the screens (components/roo/RicoPal.tsx). */
+  ricoRoams: boolean
+  /** Rico is the traveller's local guide (tourist mode): he wears his guide glasses, and his agent recommends places
+   *  and offers to plan the whole day. */
+  ricoGuide: boolean
+  /** What Rico is saying in his speech bubble, with the answers to tap. */
+  ricoBubble: RicoBubble | null
+  /** A line for Rico to start the chat with when it next opens (a check-in, where he can't talk out loud). */
+  rooChatSay: string | null
+}
+
+export interface RicoBubble {
+  text: string
+  /** Each answer brings Rico up talking or in the chat, or sets "Hey Rico" up in Me (his offer). */
+  replies: { label: string; then: 'voice' | 'chat' | 'hey-rico'; say?: string }[]
+  /** When it came up: a bubble left alone goes after a while. */
+  at: number
+}
+
+export interface RicoVoiceRequest {
+  /** A tap on Talk or on Rico, "Hey Rico", or one of his own nudges. */
+  from: 'tap' | 'wake' | 'nudge'
+  /** "tourist": the traveller is new in the city, and Rico is their guide. */
+  mode?: 'tourist'
+  /** Something for Rico to start with (a nudge's words). */
+  say?: string
+}
+
+const KEY = 'reroute:prefs:v2'
+const PERSISTED: (keyof UiState)[] = ['theme', 'lang', 'leaveAlerts', 'alerts', 'demo', 'roo', 'ricoRoams', 'ricoGuide', 'started', 'tripId', 'connections']
+
+function defaults(): UiState {
+  return {
+    theme: 'system',
+    lang: 'en',
+    leaveAlerts: false,
+    alerts: DEFAULT_ALERTS,
+    demo: { enabled: false, offline: false },
+    roo: true,
+    tripId: null,
+    change: null,
+    reveal: 0,
+    autoBanner: null,
+    leaveNow: null,
+    pendingDelay: null,
+    pushReady: false,
+    ricoVoice: null,
+    ricoRoams: true,
+    ricoGuide: false,
+    ricoBubble: null,
+    rooChatSay: null,
+    optimisticDone: [],
+    started: null,
+    rooChat: false,
+    connections: {},
+    rooVoice: false,
+  }
+}
+
+function load(): UiState {
+  const base = defaults()
+  try {
+    const raw = localStorage.getItem(KEY)
+    if (raw) {
+      const saved = JSON.parse(raw) as Partial<UiState>
+      for (const k of PERSISTED) if (saved[k] !== undefined) (base as unknown as Record<string, unknown>)[k] = saved[k]
+      // "Go offline" is a demo switch for this visit only: a reload always starts online.
+      base.demo = { enabled: !!saved.demo?.enabled, offline: false }
+      // Settings saved by an older version keep their choices; new ones start at their defaults.
+      base.alerts = { ...DEFAULT_ALERTS, ...(saved.alerts ?? {}) }
+      // Neerja was the voice before Rico had its own: saved before then, it moves to Ana, once.
+      if (!(saved as { anaDefault?: boolean }).anaDefault && base.alerts.voiceId === 'en-IN-NeerjaNeural') base.alerts.voiceId = DEFAULT_ALERTS.voiceId
+      // Roo's voice was on by default and saved as "rooVoice"; only a choice made since counts.
+      base.rooVoice = (saved as { rooVoiceOn?: boolean }).rooVoiceOn === true
+    }
+  } catch {
+    /* ignore corrupt storage */
+  }
+  const params = new URLSearchParams(location.search)
+  if (params.get('demo') === '1') base.demo = { ...base.demo, enabled: true }
+  if (params.get('demo') === '0') base.demo = { ...base.demo, enabled: false }
+  return base
+}
+
+let state: UiState = load()
+const listeners = new Set<() => void>()
+
+function persist() {
+  const out: Partial<UiState> = {}
+  for (const k of PERSISTED) (out as Record<string, unknown>)[k] = state[k]
+  out.demo = { enabled: state.demo.enabled, offline: false }
+  Object.assign(out, { rooVoiceOn: state.rooVoice, anaDefault: true })
+  try {
+    localStorage.setItem(KEY, JSON.stringify(out))
+  } catch {
+    /* storage full or blocked */
+  }
+}
+
+export function getState() {
+  return state
+}
+
+export function setState(patch: Partial<UiState> | ((s: UiState) => Partial<UiState>)) {
+  const p = typeof patch === 'function' ? patch(state) : patch
+  state = { ...state, ...p }
+  persist()
+  listeners.forEach((l) => l())
+}
+
+function subscribe(l: () => void) {
+  listeners.add(l)
+  return () => listeners.delete(l)
+}
+
+export function useStore<T>(select: (s: UiState) => T): T {
+  return useSyncExternalStore(subscribe, () => select(state))
+}
+
+let token = 1
+export const nextToken = () => token++
+const uid = () => Math.random().toString(36).slice(2, 9)
+
+// ---------- Toasts ----------
+export interface ToastItem {
+  id: string
+  title: string
+  /** The version Undo makes active again. */
+  undoVersion?: number | null
+  /** A local Undo (a check-in not sent yet). */
+  onUndo?: () => void
+  /** Runs once when the toast closes for any reason other than Undo. */
+  onClose?: () => void
+  /** Milliseconds before it closes (default 8 s). */
+  duration?: number
+}
+let toasts: ToastItem[] = []
+const toastListeners = new Set<() => void>()
+export function useToasts() {
+  return useSyncExternalStore(
+    (l) => {
+      toastListeners.add(l)
+      return () => toastListeners.delete(l)
+    },
+    () => toasts,
+  )
+}
+export function getToasts() {
+  return toasts
+}
+export function showToast(t: Omit<ToastItem, 'id'>) {
+  const id = uid()
+  // A toast pushed out by newer ones still runs its close action.
+  const dropped = toasts.slice(0, -2)
+  toasts = [...toasts.slice(-2), { ...t, id }]
+  toastListeners.forEach((l) => l())
+  dropped.forEach((d) => settleToast(d.id, 'close', d))
+  return id
+}
+export function dismissToast(id: string) {
+  toasts = toasts.filter((t) => t.id !== id)
+  toastListeners.forEach((l) => l())
+}
+// Each toast's Undo or close action runs once, however it closes (button, timeout, swipe, pushed out).
+const settled = new Set<string>()
+export function settleToast(id: string, how: 'undo' | 'close', item = toasts.find((t) => t.id === id)) {
+  if (!item || settled.has(id)) return
+  settled.add(id)
+  if (how === 'undo') item.onUndo?.()
+  else item.onClose?.()
+}
+
+// ---------- Announcer ----------
+let announcement = ''
+const announceListeners = new Set<() => void>()
+export function announce(text: string) {
+  announcement = ''
+  announceListeners.forEach((l) => l())
+  setTimeout(() => {
+    announcement = text
+    announceListeners.forEach((l) => l())
+  }, 60)
+}
+export function useAnnouncement() {
+  return useSyncExternalStore(
+    (l) => {
+      announceListeners.add(l)
+      return () => announceListeners.delete(l)
+    },
+    () => announcement,
+  )
+}
+
+// ---------- The reroute choreography (UI brief, section 9) ----------
+export function prefersReducedMotion() {
+  return window.matchMedia('(prefers-reduced-motion: reduce)').matches
+}
+
+interface PlayOpts {
+  kind: 'reroute' | 'undo' | 'checkin'
+  before: DayView | null
+  after: DayView | null
+  toast?: string
+  undoVersion?: number | null
+  /** Show the automatic-shift banner instead of asking. */
+  banner?: string
+}
+
+/** Run the choreography for a change the server just made, then toast and announce it. */
+export function playChange({ kind, before, after, toast, undoVersion, banner }: PlayOpts) {
+  if (before && after) {
+    const diff = diffDays(before, after)
+    const token = nextToken()
+    setState({ change: { ...diff, token, kind, before, pillDelayMs: kind === 'reroute' ? 1000 : 0 }, pendingDelay: null })
+    // Once it has played, the change is done: coming back to Today later doesn't play it again.
+    setTimeout(() => getState().change?.token === token && setState({ change: null }), kind === 'reroute' ? 2600 : 900)
+    if (toast) {
+      const delay = kind === 'reroute' && !prefersReducedMotion() ? 1200 : 0
+      setTimeout(() => showToast({ title: toast, undoVersion: undoVersion ?? null }), delay)
+      announce(`${toast.split('.')[0]}. ${diff.announcement}${undoVersion != null ? ' Undo available.' : ''}`)
+    }
+  } else if (toast) {
+    showToast({ title: toast, undoVersion: undoVersion ?? null })
+    announce(toast)
+  }
+  if (banner) setState({ autoBanner: { text: banner, previousVersion: undoVersion ?? null, version: after?.version ?? null } })
+}

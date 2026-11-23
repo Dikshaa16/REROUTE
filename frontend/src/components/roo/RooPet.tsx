@@ -1,0 +1,84 @@
+import { motion, useReducedMotion } from 'motion/react'
+import { useState } from 'react'
+import { EASE_OUT } from '@/lib/motion'
+import { RooAvatar, useRoo3D } from '@/components/roo3d/RooAvatar'
+import type { Mood } from './mood'
+
+/**
+ * Roo as a pet, big, for the welcome screen. It springs in and waves; breathes; hops (a squash and
+ * stretch) each time it says something; and giggles, with a few hearts, when you poke it. Drawn live, it
+ * also looks at your pointer, or glances about when you're still. Springs and transforms only; reduced
+ * motion keeps it still.
+ */
+export function RooPet({ mood, hop, size = 150 }: { mood: Mood; hop: number; size?: number }) {
+  const reduce = !!useReducedMotion()
+  // The live 3D Roo hops, breathes and follows the pointer itself; its still needs the wrapper to hop.
+  const solid = useRoo3D(reduce)
+  const [poked, setPoked] = useState(0)
+  const [giggle, setGiggle] = useState(false)
+
+  const poke = () => {
+    setPoked((n) => n + 1)
+    setGiggle(true)
+    setTimeout(() => setGiggle(false), 1100)
+  }
+
+  const face: Mood = giggle ? 'celebrate' : mood
+  return (
+    <div className="relative flex flex-col items-center">
+      {/* Hearts float up from a poke. */}
+      {!reduce &&
+        poked > 0 &&
+        [0, 1, 2].map((i) => (
+          <motion.svg
+            key={`${poked}-${i}`}
+            aria-hidden="true"
+            viewBox="0 0 24 24"
+            width={18}
+            height={18}
+            className="pointer-events-none absolute top-6 text-red"
+            style={{ left: `calc(50% + ${(i - 1) * 34}px)` }}
+            initial={{ opacity: 0, transform: 'translateY(0px) scale(0.6)' }}
+            animate={{ opacity: [0, 1, 0], transform: ['translateY(0px) scale(0.6)', `translateY(-${48 + i * 14}px) scale(1)`, `translateY(-${80 + i * 18}px) scale(0.9)`] }}
+            transition={{ duration: 1.1, delay: i * 0.08, ease: EASE_OUT }}
+          >
+            <path fill="currentColor" d="M12 21s-7.5-4.6-9.6-9.3C.9 8.2 3.1 4.5 6.8 4.5c2.1 0 3.6 1.1 4.6 2.6 1-1.5 2.6-2.6 4.6-2.6 3.7 0 5.9 3.7 4.4 7.2C19.5 16.4 12 21 12 21z" />
+          </motion.svg>
+        ))}
+      <motion.div
+        initial={reduce ? { opacity: 0 } : { opacity: 0, transform: 'translateY(40px) scale(0.9)' }}
+        animate={{ opacity: 1, transform: 'translateY(0px) scale(1)' }}
+        transition={reduce ? { duration: 0.2 } : { type: 'spring', duration: 0.7, bounce: 0.35 }}
+      >
+        <button
+          type="button"
+          onClick={poke}
+          aria-label="Rico. Poke it"
+          className="block rounded-full focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-[var(--focus)]"
+        >
+          <span className={solid ? 'block' : 'rr-roo-breathe block'}>
+            {/* A hop each time Roo speaks, and a bigger one when poked: up, stretch; down, squash; settle. The 3D
+                Roo hops itself, and stays mounted so it carries on moving where it was. */}
+            <motion.span
+              key={solid ? 'solid' : `${hop}-${poked}`}
+              className="block origin-bottom"
+              initial={false}
+              animate={
+                reduce || solid || (hop === 0 && poked === 0)
+                  ? {}
+                  : {
+                      transform: giggle
+                        ? ['translateY(0px) scale(1, 1)', 'translateY(-26px) scale(0.94, 1.08)', 'translateY(0px) scale(1.1, 0.9)', 'translateY(0px) scale(1, 1)']
+                        : ['translateY(0px) scale(1, 1)', 'translateY(-12px) scale(0.97, 1.04)', 'translateY(0px) scale(1.05, 0.95)', 'translateY(0px) scale(1, 1)'],
+                    }
+              }
+              transition={{ duration: giggle ? 0.7 : 0.5, times: [0, 0.35, 0.7, 1], ease: EASE_OUT }}
+            >
+              <RooAvatar mood={face} size={size} reduce={reduce} hop={hop + poked} />
+            </motion.span>
+          </span>
+        </button>
+      </motion.div>
+    </div>
+  )
+}
