@@ -3,7 +3,6 @@
 > Intelligent, resilient trip planning for work travel across Indian cities.
 
 [![CI](https://github.com/Dikshaa16/REROUTE/actions/workflows/ci.yml/badge.svg)](https://github.com/Dikshaa16/REROUTE/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-project--specific-lightgrey.svg)](#license)
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/landing-dark.jpg">
@@ -60,7 +59,7 @@ Every choice that departs from the briefs is logged with its reason in [docs/dec
 You need Git and Docker Desktop.
 
 ```bash
-git clone https://github.com/Panther465/Reroute.git
+git clone https://github.com/Dikshaa16/REROUTE.git
 cd Reroute
 docker compose up --build
 ```
